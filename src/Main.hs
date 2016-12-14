@@ -13,8 +13,8 @@ TODO:
 
 module Main where
 
-import Control.DeepSeq
 import Control.Concurrent (threadDelay)
+import Control.DeepSeq
 import qualified Control.Foldl as L
 import Control.Monad (when)
 import Control.Monad.IO.Class
@@ -22,8 +22,6 @@ import Control.Monad.Trans.Class (lift)
 import Data.Aeson (ToJSON, FromJSON)
 import qualified Data.Aeson as J
 import qualified Data.Aeson.Types as J
-import Data.ByteString (ByteString)
-import qualified Data.ByteString.Lazy as BL
 import Data.Foldable
 import Data.HashMap.Monoidal (MonoidalHashMap)
 import qualified Data.HashMap.Monoidal as M
@@ -39,7 +37,6 @@ import qualified Data.String.Class as S
 import Data.Text (Text)
 import Data.Time
 import Data.Time.Clock.POSIX
-import Data.Traversable
 import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUID
 import GHC.Generics
@@ -131,6 +128,7 @@ newtype Batch ev =
   Batch [ev]
   deriving (Eq, Show, Monoid, ToJSON, FromJSON, NFData)
 
+unBatch :: Batch ev -> [ev]
 unBatch (Batch evs) = evs
 
 instance Event ev =>
@@ -147,24 +145,21 @@ mkPercentage :: Int -> Percentage
 mkPercentage i = Percentage i
 
 -- * Folds
--- | Count events
-countFoldInt
-  :: (Hashable k, Eq k, Event ev)
+-- | Count events via accepting `keyF` argument.
+countFoldIntKeyF
+  :: (Hashable k, Eq k)
   => (ev -> Maybe k) -> L.Fold ev (MonoidalHashMap k (Sum Int))
-countFoldInt keyF = foldMon (incr keyF)
+countFoldIntKeyF keyF = L.Fold step mempty id
+  where
+    step m ev = maybe m (\k -> M.modify (+ 1) k m) (keyF ev)
 
--- | Generic function to fold values into monoid starting with
--- 'mempty' and having no state
-foldMon
-  :: Monoid b
-  => (b -> a -> b) -> L.Fold a b
-foldMon s = L.Fold s mempty id
-
--- | Increment MHM value by one if key matches
-incr
-  :: (Monoid a, Num a, Eq k, Hashable k)
-  => (t -> Maybe k) -> MonoidalHashMap k a -> t -> MonoidalHashMap k a
-incr keyF m ev = maybe m (\k -> M.modify (+ 1) k m) (keyF ev)
+-- | Key/value version of a fold
+countFoldIntKV
+  :: (Hashable k, Eq k)
+  => L.Fold (k, ev) (MonoidalHashMap k (Sum Int))
+countFoldIntKV = L.Fold step mempty id
+  where
+    step m (k, _) = M.modify (+ 1) k m
 
 -- * Main actions
 cleanupDb :: R.Cluster -> IO ()
@@ -172,7 +167,7 @@ cleanupDb riak = do
   let buckets =
         [ eventBucketP (Proxy :: Proxy ConfusionEvent)
         , eventBucketP (Proxy :: Proxy HappinessEvent)
-        ]
+        ] :: [R.Bucket]
   forM_ buckets $ \b -> cleanUntilEmpty riak b
   where
     cleanUntilEmpty riak b = R.inCluster riak $ \c -> cleanUntilEmpty' riak b c
@@ -210,7 +205,7 @@ storeEvents riak evs = do
       (roundBy5min (utcTimeToPOSIXSeconds (eventTimestamp ev)), Batch [ev])
     storeBatch :: R.Cluster -> (POSIXTime, Batch ev) -> IO ()
     storeBatch riak (pt, batch) = do
-      R.inCluster riak $
+      _ <- R.inCluster riak $
         \c -> do
           key <- (S.fromString . UUID.toString) <$> UUID.nextRandom
           let ix = [R.IndexInt "min" (truncate pt)]
@@ -276,20 +271,35 @@ countHappinessEventsReport riak = do
   let end = roundBy5min (utcTimeToPOSIXSeconds (addUTCTime (5 * 60 - 100) t))
   let kf _ = Just ()
   let prod = produceFromBucket riak start end :: P.Producer HappinessEvent IO ()
-  res <- L.purely P.fold (countFoldInt kf) prod
+  -- keyF-folding
+  res <- L.purely P.fold (countFoldIntKeyF kf) prod
   print res
+  -- KV-folding
+  res' <- L.purely P.fold countFoldIntKV (prodWithKey kf prod)
+  print res'
   return (maybe 0 (\(Sum x) -> x) (M.lookup () res))
+
+prodWithKey
+  :: Monad m
+  => (ev -> Maybe k) -> P.Producer ev m () -> P.Producer (k, ev) m ()
+prodWithKey kf prod = P.for prod f
+  where
+    f ev = do
+      case kf ev of
+        Just k -> P.yield (k, ev)
+        Nothing -> return ()
 
 main :: IO ()
 main = do
-  print "> connecting to riak"
+  putStrLn "> connecting to riak"
   riak <- connectToRiak
-  print "> cleaning up riak"
+  putStrLn "> cleaning up riak"
   cleanupDb riak
-  print "> filling riak"
+  putStrLn "> filling riak"
   fillDb riak
-  print "> counting data"
+  putStrLn "> counting data"
   r <- countHappinessEventsReport riak
+  putStrLn "> final result received:"
   print r
 
 -- * Helpers

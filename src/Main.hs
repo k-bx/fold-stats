@@ -170,13 +170,14 @@ cleanupDb riak = do
         ] :: [R.Bucket]
   forM_ buckets $ \b -> cleanUntilEmpty riak b
   where
-    cleanUntilEmpty riak b = R.inCluster riak $ \c -> cleanUntilEmpty' riak b c
-    cleanUntilEmpty' riak b c = do
-      n <- R.foldKeys c Nothing b (delAndCount riak b) 0
+    cleanUntilEmpty riak' b = R.inCluster riak $ \c -> cleanUntilEmpty' riak' b c
+    cleanUntilEmpty' riak' b c = do
+      n <- R.foldKeys c Nothing b (delAndCount riak' b) 0
       when (n > 0) $
         do print ("> " <> show n <> " more keys to delete from " <> show b)
            threadDelay 600000
-           cleanUntilEmpty' riak b c
+           cleanUntilEmpty' riak' b c
+    delAndCount :: R.Cluster -> R.Bucket -> Int -> R.Key -> IO Int
     delAndCount r b i k =
       R.inCluster r $
       \c -> do
@@ -204,8 +205,8 @@ storeEvents riak evs = do
     evToRoundedPosixPair ev =
       (roundBy5min (utcTimeToPOSIXSeconds (eventTimestamp ev)), Batch [ev])
     storeBatch :: R.Cluster -> (POSIXTime, Batch ev) -> IO ()
-    storeBatch riak (pt, batch) = do
-      _ <- R.inCluster riak $
+    storeBatch riak' (pt, batch) = do
+      _ <- R.inCluster riak' $
         \c -> do
           key <- (S.fromString . UUID.toString) <$> UUID.nextRandom
           let ix = [R.IndexInt "min" (truncate pt)]
